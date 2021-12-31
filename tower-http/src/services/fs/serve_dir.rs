@@ -518,7 +518,7 @@ impl Future for ResponseFuture {
 }
 
 fn handle_file_request(
-    builder: Builder,
+    mut builder: Builder,
     maybe_file: Option<File>,
     maybe_range: Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>>,
     chunk_size: usize,
@@ -544,11 +544,15 @@ fn handle_file_request(
                     } else {
                         empty_body()
                     };
+                    if let Some(header_map) = builder.headers_mut() {
+                        header_map.remove(header::CONTENT_LENGTH);   
+                    }
                     builder
                         .header(
                             header::CONTENT_RANGE,
                             format!("bytes {}-{}/{}", range.start(), range.end(), size),
                         )
+                        .header(header::CONTENT_LENGTH, range_size)
                         .status(StatusCode::PARTIAL_CONTENT)
                         .body(body)
                 }
