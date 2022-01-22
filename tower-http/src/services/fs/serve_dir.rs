@@ -1,4 +1,7 @@
-use super::{open_file_with_fallback, AsyncReadBody, PrecompressedVariants};
+use super::{
+    check_modified_headers, open_file_with_fallback, AsyncReadBody, IfModifiedSince,
+    IfUnmodifiedSince, LastModified, PrecompressedVariants,
+};
 use crate::services::fs::file_metadata_with_fallback;
 use crate::{
     content_encoding::{encodings, Encoding},
@@ -14,6 +17,7 @@ use percent_encoding::percent_decode;
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::ops::RangeInclusive;
+use std::path::Component;
 use std::{
     future::Future,
     io,
@@ -130,17 +134,28 @@ impl ServeVariant {
 }
 
 fn build_and_validate_path(base_path: &Path, requested_path: &str) -> Option<PathBuf> {
-    // build and validate the path
     let path = requested_path.trim_start_matches('/');
 
     let path_decoded = percent_decode(path.as_ref()).decode_utf8().ok()?;
+    let path_decoded = Path::new(&*path_decoded);
 
     let mut full_path = base_path.to_path_buf();
-    for seg in path_decoded.split('/') {
-        if seg.starts_with("..") || seg.contains('\\') {
-            return None;
+    for component in path_decoded.components() {
+        match component {
+            Component::Normal(comp) => {
+                // protect against paths like `/foo/c:/bar/baz` (#204)
+                if Path::new(&comp)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_)))
+                {
+                    full_path.push(comp)
+                } else {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
         }
-        full_path.push(seg);
     }
     Some(full_path)
 }
@@ -264,7 +279,7 @@ async fn maybe_redirect_or_append_path(
             full_path.push("index.html");
             return None;
         } else {
-            return Some(Output::NotFound);
+            return Some(Output::StatusCode(StatusCode::NOT_FOUND));
         }
     }
     None
@@ -304,6 +319,15 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
             self.precompressed_variants.unwrap_or_default(),
         );
 
+        let if_unmodified_since = req
+            .headers()
+            .get(header::IF_UNMODIFIED_SINCE)
+            .and_then(IfUnmodifiedSince::from_header_value);
+        let if_modified_since = req
+            .headers()
+            .get(header::IF_MODIFIED_SINCE)
+            .and_then(IfModifiedSince::from_header_value);
+
         let request_method = req.method().clone();
         let variant = self.variant.clone();
 
@@ -339,6 +363,16 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
                 Method::HEAD => {
                     let (meta, maybe_encoding) =
                         file_metadata_with_fallback(full_path, negotiated_encodings).await?;
+
+                    let last_modified = meta.modified().ok().map(LastModified::from);
+                    if let Some(status_code) = check_modified_headers(
+                        last_modified.as_ref(),
+                        if_unmodified_since,
+                        if_modified_since,
+                    ) {
+                        return Ok(Output::StatusCode(status_code));
+                    }
+
                     let maybe_range = try_parse_range(range_header.as_ref(), meta.len());
                     Ok(Output::File(FileRequest {
                         extent: FileRequestExtent::Head(meta),
@@ -346,12 +380,22 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
                         mime_header_value: mime,
                         maybe_encoding,
                         maybe_range,
+                        last_modified,
                     }))
                 }
                 _ => {
                     let (mut file, maybe_encoding) =
                         open_file_with_fallback(full_path, negotiated_encodings).await?;
                     let meta = file.metadata().await?;
+                    let last_modified = meta.modified().ok().map(LastModified::from);
+                    if let Some(status_code) = check_modified_headers(
+                        last_modified.as_ref(),
+                        if_unmodified_since,
+                        if_modified_since,
+                    ) {
+                        return Ok(Output::StatusCode(status_code));
+                    }
+
                     let maybe_range = try_parse_range(range_header.as_ref(), meta.len());
                     if let Some(Ok(ranges)) = maybe_range.as_ref() {
                         // If there is any other amount of ranges than 1 we'll return an unsatisfiable later as there isn't yet support for multipart ranges
@@ -365,6 +409,7 @@ impl<ReqBody> Service<Request<ReqBody>> for ServeDir {
                         mime_header_value: mime,
                         maybe_encoding,
                         maybe_range,
+                        last_modified,
                     }))
                 }
             }
@@ -424,7 +469,7 @@ fn append_slash_on_path(uri: Uri) -> Uri {
 enum Output {
     File(FileRequest),
     Redirect(HeaderValue),
-    NotFound,
+    StatusCode(StatusCode),
 }
 
 struct FileRequest {
@@ -433,6 +478,7 @@ struct FileRequest {
     mime_header_value: HeaderValue,
     maybe_encoding: Option<Encoding>,
     maybe_range: Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>>,
+    last_modified: Option<LastModified>,
 }
 
 enum FileRequestExtent {
@@ -472,6 +518,11 @@ impl Future for ResponseFuture {
                             builder = builder
                                 .header(header::CONTENT_ENCODING, encoding.into_header_value());
                         }
+                        if let Some(last_modified) = file_request.last_modified {
+                            builder =
+                                builder.header(header::LAST_MODIFIED, last_modified.0.to_string());
+                        }
+
                         let res = handle_file_request(
                             builder,
                             maybe_file,
@@ -491,11 +542,8 @@ impl Future for ResponseFuture {
                         Poll::Ready(Ok(res))
                     }
 
-                    Ok(Output::NotFound) => {
-                        let res = Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(empty_body())
-                            .unwrap();
+                    Ok(Output::StatusCode(code)) => {
+                        let res = Response::builder().status(code).body(empty_body()).unwrap();
 
                         Poll::Ready(Ok(res))
                     }
@@ -988,15 +1036,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_cjk_percent_encoded_uri_path() {
-        let cjk_filename = "你好世界.txt";
         // percent encoding present of 你好世界.txt
         let cjk_filename_encoded = "%E4%BD%A0%E5%A5%BD%E4%B8%96%E7%95%8C.txt";
 
-        let tmp_dir = std::env::temp_dir();
-        let tmp_filename = std::path::Path::new(tmp_dir.as_path()).join(cjk_filename);
-        let _ = tokio::fs::File::create(&tmp_filename).await.unwrap();
-
-        let svc = ServeDir::new(&tmp_dir);
+        let svc = ServeDir::new("../test-files");
 
         let req = Request::builder()
             .uri(format!("/{}", cjk_filename_encoded))
@@ -1006,20 +1049,13 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "text/plain");
-        let _ = tokio::fs::remove_file(&tmp_filename).await.unwrap();
     }
 
     #[tokio::test]
     async fn access_space_percent_encoded_uri_path() {
-        let raw_filename = "filename with space.txt";
-        // percent encoding present of "filename with space.txt"
         let encoded_filename = "filename%20with%20space.txt";
 
-        let tmp_dir = std::env::temp_dir();
-        let tmp_filename = std::path::Path::new(tmp_dir.as_path()).join(raw_filename);
-        let _ = tokio::fs::File::create(&tmp_filename).await.unwrap();
-
-        let svc = ServeDir::new(&tmp_dir);
+        let svc = ServeDir::new("../test-files");
 
         let req = Request::builder()
             .uri(format!("/{}", encoded_filename))
@@ -1029,7 +1065,6 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "text/plain");
-        let _ = tokio::fs::remove_file(&tmp_filename).await.unwrap();
     }
 
     #[tokio::test]
@@ -1127,5 +1162,73 @@ mod tests {
             res.headers()["content-range"],
             &format!("bytes */{}", file_contents.len())
         )
+    }
+    #[tokio::test]
+    async fn last_modified() {
+        let svc = ServeDir::new("..");
+        let req = Request::builder()
+            .uri("/README.md")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let last_modified = res
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .expect("Missing last modified header!");
+
+        // -- If-Modified-Since
+
+        let svc = ServeDir::new("..");
+        let req = Request::builder()
+            .uri("/README.md")
+            .header(header::IF_MODIFIED_SINCE, last_modified)
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let body = res.into_body().data().await;
+        assert!(body.is_none());
+
+        let svc = ServeDir::new("..");
+        let req = Request::builder()
+            .uri("/README.md")
+            .header(header::IF_MODIFIED_SINCE, "Fri, 09 Aug 1996 14:21:40 GMT")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let readme_bytes = include_bytes!("../../../../README.md");
+        let body = res.into_body().data().await.unwrap().unwrap();
+        assert_eq!(body.as_ref(), readme_bytes);
+
+        // -- If-Unmodified-Since
+
+        let svc = ServeDir::new("..");
+        let req = Request::builder()
+            .uri("/README.md")
+            .header(header::IF_UNMODIFIED_SINCE, last_modified)
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().data().await.unwrap().unwrap();
+        assert_eq!(body.as_ref(), readme_bytes);
+
+        let svc = ServeDir::new("..");
+        let req = Request::builder()
+            .uri("/README.md")
+            .header(header::IF_UNMODIFIED_SINCE, "Fri, 09 Aug 1996 14:21:40 GMT")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+        let body = res.into_body().data().await;
+        assert!(body.is_none());
     }
 }
