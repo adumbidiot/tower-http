@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- The CORS layer / service methods `allow_headers`, `allow_methods`, `allow_origin`
+  and `expose_headers` now do nothing if given an empty `Vec`, instead of sending
+  the respective header with an empty value
+
+# 0.2.2 (February 8, 2022)
+
+## Fixed
+
+- Add `Vary` headers for CORS preflight responses ([#216])
+
+[#216]: https://github.com/tower-rs/tower-http/pull/216
+
 # 0.2.1 (January 21, 2022)
 
 ## Added
