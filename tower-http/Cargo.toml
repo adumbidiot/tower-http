@@ -1,7 +1,7 @@
 [package]
 name = "tower-http"
 description = "Tower middleware and utilities for HTTP clients and servers"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Tower Maintainers <team@tower-rs.com>"]
 edition = "2018"
 license = "MIT"
@@ -48,12 +48,14 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.4.10", features = ["buffer", "util", "retry", "make", "timeout"] }
 tracing-subscriber = "0.3"
 uuid = { version = "0.8", features = ["v4"] }
+serde_json = "1.0"
 
 [features]
 default = []
 full = [
     "add-extension",
     "auth",
+    "catch-panic",
     "compression-full",
     "cors",
     "decompression-full",
@@ -73,6 +75,7 @@ full = [
 
 add-extension = []
 auth = ["base64"]
+catch-panic = ["tracing", "futures-util/std"]
 cors = []
 follow-redirect = ["iri-string", "tower/util"]
 fs = ["tokio/fs", "tokio-util/io", "tokio/io-util", "mime_guess", "mime", "percent-encoding", "httpdate"]

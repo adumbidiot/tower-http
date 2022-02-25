@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
-- None.
+- Added `CatchPanic` middleware which catches panics and converts them
+  into `500 Internal Server` responses
 
 ## Changed
 
@@ -21,9 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- None.
+
+# 0.2.3 (February 18, 2022)
+
+## Changed
+
+- Update to tokio-util 0.7 ([#221])
+
+## Fixed
+
 - The CORS layer / service methods `allow_headers`, `allow_methods`, `allow_origin`
   and `expose_headers` now do nothing if given an empty `Vec`, instead of sending
-  the respective header with an empty value
+  the respective header with an empty value ([#218])
+
+[#218]: https://github.com/tower-rs/tower-http/pull/218
+[#221]: https://github.com/tower-rs/tower-http/pull/221
 
 # 0.2.2 (February 8, 2022)
 
